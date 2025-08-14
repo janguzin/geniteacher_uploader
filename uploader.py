@@ -1,301 +1,312 @@
-# uploader.py
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+# uploader.py — GENITEACHER 다중 세트(10월/11월 등) 순차 업로드 + OCR 대기 + 저장(5초 딜레이)
+from playwright.sync_api import sync_playwright
 from pathlib import Path
-import csv, re, os
+from getpass import getpass
+import os, re, sys, time
 
-# ===== 페이지/셀렉터(네 화면에 맞게 확인) =====
-UPLOAD_URL   = "https://www.geniteacher.com/test-paper-upsert?id=0"   # 문제 생성 첫 화면 URL
-SEL_TITLE    = 'input[placeholder="문제 등록을 위해 먼저 학습지명을 작성해 주세요."]'
-TEXT_NEXT    = "다음"
-TEXT_SAVE    = "저장"
-TEXT_BTN_PROBLEM  = "문제지 파일 선택"
-TEXT_BTN_SOLUTION = "답안지 파일 선택"
-SEL_OCR_DONE = None  # OCR 완료 문구가 화면에 있으면 예: 'text=OCR 완료' 로 변경
-# ============================================
+# ===================== 설정 =====================
+UPLOAD_URL      = "https://www.geniteacher.com/test-paper-upsert?id=0"  # 문제 생성 페이지
+CATEGORIES      = ["기출문제", "고3", "수학"]                             # 클릭 순서
+STORAGE_PATH    = "geni_storage.json"                                    # 세션 파일
+EDGE_CHANNEL    = "msedge"                                               # Edge 실행
+OCR_TIMEOUT_MS  = 15 * 60 * 1000                                         # OCR 최대 대기(15분)
+SAVE_DELAY_SEC  = 5                                                      # OCR 완료 후 저장까지 지연(초)
 
-CSV_PATH       = "jobs.csv"
-AUTH_STATE     = "auth_state.json"
-TIMEOUT_UI_MS  = 30_000
-TIMEOUT_OCR_MS = 15 * 60 * 1000  # 15분
+# ===================== 파일명 인식 =====================
+ALLOWED_EXTS = {".pdf", ".doc", ".docx"}
+# 예: 2015_11_수학_문제.pdf / 2015_11_수학_해설.pdf / 2015_11_수학_답지(1).PDF / ...
+PATTERN = re.compile(
+    r"""^(?P<base>.+?)_
+         (?P<role>문제(?:지)?|해설(?:지)?|답(?:안|지)?)
+         \s*(?:\(\d+\))?
+         (?:\.[^.]+)+$
+     """,
+    re.IGNORECASE | re.VERBOSE
+)
 
-def read_jobs():
-    with open(CSV_PATH, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            cats = (r.get("categories") or "").strip()
-            cats_list = [c.strip() for c in re.split(r"[|,]", cats) if c.strip()]
-            yield dict(
-                name=r["name"].strip(),
-                problem=Path(r["problem_path"]).as_posix(),
-                solution=Path(r["solution_path"]).as_posix(),
-                categories=cats_list
-            )
+def find_all_pairs_in_folder(folder: Path, debug=True):
+    """폴더 안의 모든 (base, 문제, 해설) 쌍을 반환. base 오름차순 정렬."""
+    if not folder.exists(): raise FileNotFoundError(f"경로가 존재하지 않습니다: {folder}")
+    if not folder.is_dir(): raise FileNotFoundError(f"폴더가 아니라 파일입니다: {folder}")
 
-def wait_button_enabled(page, text, timeout=30_000):
-    page.wait_for_function(
-        """
-        (t) => {
-          const all = [...document.querySelectorAll('button, [role=button]')];
-          const btn = all.find(el => (el.innerText||el.textContent||'').includes(t));
-          return btn && !btn.disabled && !btn.ariaDisabled;
-        }
-        """,
-        arg=text, timeout=timeout
-    )
+    by_base, skipped = {}, []
+    for p in folder.iterdir():
+        if not p.is_file():
+            continue
+        # 이중 확장자(.pdf.pdf 등)도 허용
+        if not any(sfx.lower() in ALLOWED_EXTS for sfx in p.suffixes):
+            skipped.append((p.name, "확장자 제외")); continue
+        m = PATTERN.match(p.name.strip())
+        if not m:
+            skipped.append((p.name, "이름 패턴 불일치")); continue
+        base = m.group("base").strip()
+        role = "문제" if "문제" in m.group("role") else "해설"  # 답지/답안은 해설로
+        d = by_base.setdefault(base, {})
+        # 중복 파일이 있으면 최초만 사용
+        d.setdefault(role, p)
 
-def click_button_by_text(page, text, timeout=30_000):
-    wait_button_enabled(page, text, timeout=timeout)
-    # role=button 우선, 실패 시 텍스트로
-    try:
-        page.get_by_role("button", name=text).click()
-    except Exception:
-        page.get_by_text(text, exact=True).click()
+    pairs = []
+    for base, d in by_base.items():
+        if "문제" in d and "해설" in d:
+            pairs.append((base, d["문제"], d["해설"]))
 
-def solidify_input(page, selector):
-    page.dispatch_event(selector, "input")
-    page.dispatch_event(selector, "change")
-    try:
-        page.press(selector, "Enter")
-    except Exception:
-        pass
-    page.click("body")
+    # base 기준 사전순 정렬 (원하면 여기서 년/월 파싱해서 커스텀 정렬도 가능)
+    pairs.sort(key=lambda x: x[0])
 
-def select_categories(page, names):
-    if not names:
-        return
-    cat_input = None
-    # 1) placeholder 시도
-    try:
-        cat_input = page.get_by_placeholder("카테고리")
-        cat_input.wait_for(timeout=1500)
-    except Exception:
-        cat_input = None
-    # 2) '카테고리' 라벨 인근 input
-    if cat_input is None:
-        try:
-            container = page.locator("section,div,form").filter(has_text="카테고리").first
-            cat_input = container.locator("input").first
-            cat_input.wait_for(timeout=1500)
-        except Exception:
-            cat_input = None
-    # 3) combobox 역할 input
-    if cat_input is None:
-        try:
-            cat_input = page.locator('input[role="combobox"]').first
-            cat_input.wait_for(timeout=1500)
-        except Exception:
-            pass
-    if cat_input is None:
-        print("[INFO] 카테고리 입력칸을 못 찾았지만, 카테고리 없이 진행합니다.")
-        return
+    if debug:
+        print("▼ 스캔 결과 요약")
+        for base, d in by_base.items():
+            print(f"  - {base}: 문제={bool(d.get('문제'))}, 해설={bool(d.get('해설'))}")
+        if skipped:
+            print("▼ 스킵된 파일(이유):")
+            for n, why in skipped:
+                print(f"  * {n} -> {why}")
+        print(f"▶ 업로드 대상 쌍: {len(pairs)}개")
 
-    for name in names:
-        try:
-            cat_input.fill("")
-            cat_input.type(name, delay=50)
-            page.wait_for_timeout(600)
-            clicked = False
-            try:
-                page.locator("li,div[role='option']").filter(has_text=name).first.click(timeout=800)
-                clicked = True
-            except Exception:
-                pass
-            if not clicked:
-                cat_input.press("Enter")
-            page.wait_for_timeout(150)
-        except Exception as e:
-            print(f"[WARN] 카테고리 추가 실패: {name} / {e}")
-
-def assert_file(p: str, label: str):
-    path = Path(p)
-    if not path.exists():
-        raise FileNotFoundError(f"{label} 경로가 존재하지 않습니다: {p}")
-    if path.is_dir():
-        raise FileNotFoundError(f"{label} 경로가 파일이 아니라 폴더입니다: {p}")
-    return path.as_posix()
-
-def _wait_filename_near_button(page, button_name: str, filename: str, timeout=5000):
-    """
-    업로드 버튼 근처에 파일명이 노출되는 UI가 흔해 이를 근거로 업로드 반영을 검증.
-    파일명 일부만 뜨는 경우를 고려해 basename으로 부분 매칭.
-    """
-    base = os.path.basename(filename)
-    try:
-        btn = page.get_by_role("button", name=button_name)
-    except Exception:
-        btn = page.get_by_text(button_name, exact=True)
-    # 버튼의 조상 컨테이너 근처에서 파일명 텍스트 대기
-    container = btn.locator("xpath=ancestor-or-self::*[self::button or @role='button' or self::div or self::section][1]")
-    page.wait_for_function(
-        """([sel, base]) => {
-            const root = document.querySelector(sel);
-            if (!root) return false;
-            const text = (root.innerText||root.textContent||'') + ' ' + (root.parentElement?.innerText||'');
-            return text.includes(base);
-        }""",
-        arg=[container.evaluate("e=>e.tagName.toLowerCase()==='button'?'button':null") or "button", base],
-        timeout=timeout
-    )
-
-def upload_one_with_file_chooser(page, button_name: str, filepath: str, timeout=TIMEOUT_UI_MS):
-    """
-    파일선택 다이얼로그를 수신하는 가장 안전한 방식.
-    """
-    try:
-        with page.expect_file_chooser(timeout=timeout) as fc_info:
-            # 버튼 클릭으로 파일선택 유도 (role 실패 시 텍스트로 시도)
-            try:
-                page.get_by_role("button", name=button_name).click()
-            except Exception:
-                page.get_by_text(button_name, exact=True).click()
-        fc = fc_info.value
-        fc.set_files(filepath)
-        # 파일명 표시 대기(가능한 경우)
-        try:
-            _wait_filename_near_button(page, button_name, filepath, timeout=5000)
-        except Exception:
-            pass
-        return True
-    except Exception as e:
-        print(f"[WARN] 파일선택기 방식 실패({button_name}): {e}")
-        return False
-
-def upload_one_fallback_inject(page, button_name: str, filepath: str, timeout=TIMEOUT_UI_MS):
-    """
-    버튼 주변에서 가장 가까운 input[type=file]을 찾아 직접 주입하는 정밀 대안.
-    버튼 클릭 후 DOM 변화를 잠시 기다리고 인접 input을 탐색.
-    """
-    # 버튼 한 번 눌러서 렌더를 유도
-    try:
-        try:
-            btn = page.get_by_role("button", name=button_name)
-        except Exception:
-            btn = page.get_by_text(button_name, exact=True)
-        btn.click(timeout=2000)
-    except Exception:
-        pass
-
-    # 버튼 기준 근접 input[type=file] 탐색
-    try:
-        try:
-            btn = page.get_by_role("button", name=button_name)
-        except Exception:
-            btn = page.get_by_text(button_name, exact=True)
-
-        # 버튼의 조상 컨테이너들에서 파일 인풋 찾기
-        input_loc = (
-            btn.locator("xpath=ancestor-or-self::*").locator("input[type='file']")
+    if not pairs:
+        raise FileNotFoundError(
+            "업로드할 '(*)_문제' 와 '(*)_해설(=해설지/답지/답안)' 쌍을 찾지 못했습니다."
         )
-        if input_loc.count() == 0:
-            # 전역에서라도 최근에 생성된 보이는 파일 인풋 우선
-            input_loc = page.locator("input[type='file']:not([disabled])")
+    return pairs
 
-        input_loc.first.set_input_files(filepath)
-        # onChange가 먹도록 이벤트 대기
-        page.wait_for_timeout(300)
+# ===================== 브라우저/컨텍스트 =====================
+def get_browser_and_context(p):
+    """세션 파일(STORAGE_PATH) 있으면 재사용, 없으면 새 컨텍스트."""
+    browser = p.chromium.launch(headless=False, channel=EDGE_CHANNEL)
+    if os.path.exists(STORAGE_PATH):
+        ctx = browser.new_context(storage_state=STORAGE_PATH)
+    else:
+        ctx = browser.new_context()
+    return browser, ctx
 
-        # 파일명 표시 대기(가능한 경우)
+# ===================== 페이지 보장/로그인 =====================
+def on_create_page(page) -> bool:
+    """문제 생성 페이지인지 판별: '학습지명/문제지명' 인풋 존재 확인"""
+    field = page.locator("input[placeholder*='학습지명']")
+    if field.count() == 0:
+        field = page.locator(
+            "xpath=//label[contains(., '학습지명') or contains(., '문제지명')]/following::input[1]"
+        )
+    return field.count() > 0
+
+def try_login_if_needed(page):
+    """
+    로그인 페이지면 자동 로그인(ENV 없으면 콘솔 입력) 후
+    곧바로 문제 생성 페이지로 이동.
+    """
+    if "login" not in page.url.lower():
+        return
+
+    user = os.getenv("GENI_ID")
+    pw   = os.getenv("GENI_PW")
+    if not user:
+        user = input("GENITEACHER 아이디: ").strip()
+    if not pw:
+        pw = getpass("GENITEACHER 비밀번호: ").strip()
+    if not user or not pw:
+        raise RuntimeError("아이디/비밀번호가 비었습니다.")
+
+    print("[*] 로그인 페이지 감지 → 자동 로그인")
+    page.fill("input[name*='email' i], input[name*='id' i], input[name*='user' i], input[type='text']", user)
+    page.fill("input[type='password'], input[name*='pass' i]", pw)
+    btn = page.get_by_role("button", name=re.compile("로그인|Login|Sign in", re.I))
+    if btn.count() == 0:
+        btn = page.locator("button[type='submit'], input[type='submit']").first
+    btn.click()
+
+    page.wait_for_load_state("networkidle")
+    time.sleep(0.8)
+    page.goto(UPLOAD_URL, wait_until="load")
+    page.wait_for_load_state("networkidle")
+
+def reach_create_page(page, max_steps=4):
+    """
+    어디로 리다이렉트되든 최종적으로 '문제 생성' 페이지로 진입.
+    """
+    for _ in range(max_steps):
+        if on_create_page(page):
+            return
+        page.goto(UPLOAD_URL, wait_until="load")
+        page.wait_for_load_state("networkidle")
+        if on_create_page(page):
+            return
+        if "login" in page.url.lower():
+            try_login_if_needed(page)
+            if on_create_page(page):
+                return
+        # 메뉴 경유(명칭이 다르면 여기 수정)
         try:
-            _wait_filename_near_button(page, button_name, filepath, timeout=5000)
+            mgmt = (page.get_by_role("link", name=re.compile("^문제\s*관리$")) |
+                    page.get_by_text("문제 관리", exact=True) |
+                    page.locator("text=문제 관리").first)
+            if mgmt.count():
+                mgmt.click(); page.wait_for_load_state("networkidle")
         except Exception:
             pass
-        return True
-    except Exception as e:
-        print(f"[ERROR] fallback 주입 실패({button_name}): {e}")
-        return False
-
-def upload_files(page, problem_path: str, solution_path: str):
-    """
-    버튼별로 안전하게 업로드.
-    1순위: file chooser, 2순위: 버튼 인접 input 직접 주입
-    """
-    # 문제지
-    ok1 = upload_one_with_file_chooser(page, TEXT_BTN_PROBLEM, problem_path)
-    if not ok1:
-        ok1 = upload_one_fallback_inject(page, TEXT_BTN_PROBLEM, problem_path)
-    if not ok1:
-        raise RuntimeError("문제지 업로드 실패")
-
-    # 답안지
-    ok2 = upload_one_with_file_chooser(page, TEXT_BTN_SOLUTION, solution_path)
-    if not ok2:
-        ok2 = upload_one_fallback_inject(page, TEXT_BTN_SOLUTION, solution_path)
-    if not ok2:
-        raise RuntimeError("답안지 업로드 실패")
-
-def main():
-    with sync_playwright() as p:
-        # Edge 채널이 없으면 기본 chromium 사용
         try:
-            browser = p.chromium.launch(headless=False, channel="msedge")
+            create_btn = (page.get_by_role("link", name=re.compile("문제\s*(생성|등록|만들기)")) |
+                          page.get_by_role("button", name=re.compile("문제\s*(생성|등록|만들기)")) |
+                          page.locator("a[href*='test-paper-upsert']").first)
+            if create_btn.count():
+                create_btn.click(); page.wait_for_load_state("networkidle")
+                if on_create_page(page): return
         except Exception:
-            browser = p.chromium.launch(headless=False)
+            pass
+    raise RuntimeError("문제 생성 페이지로 이동하지 못했습니다. 사이트 메뉴/레이아웃이 변경된 듯합니다.")
 
-        ctx = browser.new_context(storage_state=AUTH_STATE if Path(AUTH_STATE).exists() else None)
-        page = ctx.new_page()
+# ===================== OCR 대기 + 저장 =====================
+BUSY_REGEX = re.compile(r"(OCR|변환|추출|처리 중|분석 중)", re.I)
 
-        # 첫 실행: 로그인 세션 저장
-        if not Path(AUTH_STATE).exists():
-            page.goto(UPLOAD_URL)
-            input("[처음 실행] 브라우저에서 로그인 완료 후 콘솔에 Enter → ")
-            ctx.storage_state(path=AUTH_STATE)
+def _ocr_done_signal(page) -> bool:
+    # 저장/저장하기/완료 버튼 또는 문항 리스트가 보이면 완료로 간주
+    if page.get_by_role("button", name=re.compile("저장하기|저장|완료")).count() > 0:
+        return True
+    if page.locator("text=문항").count() > 0:
+        return True
+    if page.locator("[data-testid='question-list'], .question-list").count() > 0:
+        return True
+    return False
 
-        for job in read_jobs():
-            print(f"\n[RUN] {job['name']}")
-            try:
-                # 1) 첫 화면 로드
-                page.goto(UPLOAD_URL, wait_until="domcontentloaded")
+def wait_for_ocr_finish(page, timeout_ms=OCR_TIMEOUT_MS):
+    start = time.time()
+    try:
+        page.get_by_text("문제 설정").first.wait_for(state="visible", timeout=120000)
+    except:
+        pass
+    while True:
+        try:
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except:
+            pass
+        if _ocr_done_signal(page):
+            return
+        body = ""
+        try:
+            body = page.inner_text("body")[:200000]
+        except:
+            pass
+        if body and not BUSY_REGEX.search(body):
+            return
+        if (time.time() - start) * 1000 > timeout_ms:
+            raise TimeoutError("OCR 작업이 제한 시간 내에 끝나지 않았습니다.")
+        time.sleep(1.2)
 
-                # 2) 학습지명 입력
-                page.wait_for_selector(SEL_TITLE, timeout=TIMEOUT_UI_MS)
-                page.fill(SEL_TITLE, job["name"])
-                solidify_input(page, SEL_TITLE)
+def wait_until_enabled(locator, timeout_ms=60000):
+    start = time.time()
+    while time.time() - start < timeout_ms/1000:
+        try:
+            if locator.is_enabled(): return True
+        except:
+            pass
+        time.sleep(0.3)
+    return False
 
-                # 3) 카테고리 (있으면)
-                select_categories(page, job["categories"])
-
-                # 4) 다음
-                click_button_by_text(page, TEXT_NEXT, timeout=30_000)
-
-                # 5) 업로드 화면 준비 (버튼 보일 때까지)
-                try:
-                    page.get_by_role("button", name=TEXT_BTN_PROBLEM).wait_for(timeout=TIMEOUT_UI_MS)
-                except Exception:
-                    page.get_by_text(TEXT_BTN_PROBLEM, exact=True).wait_for(timeout=TIMEOUT_UI_MS)
-
-                try:
-                    page.get_by_role("button", name=TEXT_BTN_SOLUTION).wait_for(timeout=TIMEOUT_UI_MS)
-                except Exception:
-                    page.get_by_text(TEXT_BTN_SOLUTION, exact=True).wait_for(timeout=TIMEOUT_UI_MS)
-
-                # 6) 파일 존재 확인 후 업로드
-                prob = assert_file(job["problem"], "문제지")
-                sol  = assert_file(job["solution"], "답안지")
-                upload_files(page, prob, sol)
-
-                # 7) 다음 → OCR 대기
-                click_button_by_text(page, TEXT_NEXT, timeout=30_000)
-
-                # 8) OCR 완료 → 저장
-                if SEL_OCR_DONE:
-                    try:
-                        page.wait_for_selector(SEL_OCR_DONE, timeout=TIMEOUT_OCR_MS)
-                    except PWTimeout:
-                        print("[INFO] OCR 문구 미검출 → '저장' 버튼 활성화로 대기")
-                click_button_by_text(page, TEXT_SAVE, timeout=TIMEOUT_OCR_MS)
-
-                print(f"[OK] {job['name']} 완료")
-
-            except Exception as e:
-                safe = re.sub(r'[^\w가-힣.-]+','_', job['name'])
-                shot = f"fail_{safe}.png"
-                try:
-                    page.screenshot(path=shot, full_page=True)
-                except Exception:
+def click_save(page):
+    candidates = [
+        "button:has-text('저장하기')",
+        "button:has-text('저장')",
+        "button:has-text('완료')",
+    ]
+    for sel in candidates:
+        try:
+            btn = page.locator(sel)
+            if btn.count():
+                if not wait_until_enabled(btn.first, 120000):
                     pass
-                print(f"[FAIL] {job['name']} / {e} / 스샷: {shot}")
+                btn.first.click()
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                except:
+                    pass
+                return
+        except:
+            continue
+    btn = page.get_by_role("button", name=re.compile("저장하기|저장|완료"))
+    if btn.count():
+        btn.first.click()
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except:
+            pass
+        return
+    raise RuntimeError("저장 버튼을 찾지 못했습니다.")
 
-        ctx.storage_state(path=AUTH_STATE)
-        browser.close()
+# ===================== 핵심 동작: 한 쌍 업로드 =====================
+def process_one_set(page, base, problem_file: Path, answer_file: Path):
+    """한 세트(문제/해설) 업로드 → 다음 → OCR 대기 → (5초) → 저장."""
+    # 항상 문제 생성 페이지에서 시작하도록 보장
+    reach_create_page(page)
 
+    # 1) 문제지명 입력
+    name_input = page.locator("input[placeholder*='학습지명']")
+    if name_input.count() == 0:
+        name_input = page.locator(
+            "xpath=//label[contains(., '학습지명') or contains(., '문제지명')]/following::input[1]"
+        )
+    if name_input.count() == 0:
+        raise RuntimeError("학습지명 입력 칸을 찾지 못했습니다.")
+    name_input.first.click()
+    name_input.first.fill(base)
+
+    # 2) 카테고리 선택
+    for cat in CATEGORIES:
+        loc = page.get_by_text(cat, exact=True)
+        if loc.count() == 0:
+            loc = page.locator(f"text={cat}").first
+        loc.click()
+
+    # 3) 파일 업로드
+    file_inputs = page.locator("input[type='file']")
+    file_inputs.nth(0).set_input_files(str(problem_file))
+    file_inputs.nth(1).set_input_files(str(answer_file))
+
+    # 4) [다음] 클릭
+    next_btn = page.get_by_role("button", name=re.compile("^다음$"))
+    if not wait_until_enabled(next_btn, timeout_ms=120000):
+        print("경고: [다음] 버튼이 아직 비활성입니다. 그래도 클릭 시도합니다.")
+    next_btn.click()
+
+    # 5) OCR 완료 대기 → 5초 대기 → 저장
+    print(f"[*] {base} : OCR 변환 대기 중...")
+    wait_for_ocr_finish(page, timeout_ms=OCR_TIMEOUT_MS)
+    print(f"[✓] {base} : OCR 완료 감지. {SAVE_DELAY_SEC}초 대기 후 저장합니다...")
+    time.sleep(SAVE_DELAY_SEC)
+    click_save(page)
+    print(f"[✓] {base} : 저장 완료.")
+
+# ===================== 메인(여러 쌍 순차 처리) =====================
+def run(folder: Path):
+    pairs = find_all_pairs_in_folder(folder, debug=True)  # [(base, 문제, 해설), ...]
+    with sync_playwright() as p:
+        browser, context = get_browser_and_context(p)
+        page = context.new_page()
+
+        # 첫 진입: 목표 페이지 → 로그인 필요시 처리
+        page.goto(UPLOAD_URL, wait_until="load")
+        page.wait_for_load_state("networkidle")
+        try_login_if_needed(page)
+        reach_create_page(page)
+
+        # 모든 쌍 순차 업로드
+        for i, (base, prob, ans) in enumerate(pairs, 1):
+            print(f"\n=== [{i}/{len(pairs)}] {base} 업로드 시작 ===")
+            process_one_set(page, base, prob, ans)
+
+            # 다음 세트를 위해 문제 생성 페이지로 복귀
+            # (사이트에 따라 '문제 생성' 버튼/링크로 돌아가는 과정이 필요할 수 있어 강제 이동)
+            page.goto(UPLOAD_URL, wait_until="load")
+            page.wait_for_load_state("networkidle")
+
+        # 세션 저장
+        context.storage_state(path=STORAGE_PATH)
+        print("\n[✓] 모든 세트 업로드 및 저장 완료.")
+
+# ===================== 실행 진입점 =====================
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) >= 2:
+        arg = sys.argv[1].strip().strip('"').strip("'").rstrip("\\/")
+        folder = Path(arg).expanduser().resolve()
+    else:
+        raw = input("업로드할 폴더 경로를 붙여넣고 엔터: ")
+        folder = Path(raw.strip().strip('"').strip("'").rstrip("\\/")).expanduser().resolve()
+    run(folder)
