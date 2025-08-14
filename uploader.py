@@ -5,22 +5,30 @@ from getpass import getpass
 import os, re, sys, time
 
 # ===================== 설정 =====================
-UPLOAD_URL      = "https://www.geniteacher.com/test-paper-upsert?id=0"  # 문제 생성 페이지
-CATEGORIES      = ["기출문제", "고3", "수학"]                             # 클릭 순서
-STORAGE_PATH    = "geni_storage.json"                                    # 세션 파일
-EDGE_CHANNEL    = "msedge"                                               # Edge 실행
-OCR_TIMEOUT_MS  = 15 * 60 * 1000                                         # OCR 최대 대기(15분)
-SAVE_DELAY_SEC  = 5                                                      # OCR 완료 후 저장까지 지연(초)
+UPLOAD_URL = "https://www.geniteacher.com/test-paper-upsert?id=0"  # 문제 생성 페이지
+CATEGORIES = ["기출문제", "고3", "수학"]  # 클릭 순서 (기본값)
+STORAGE_PATH = "geni_storage.json"  # 세션 파일
+EDGE_CHANNEL = "msedge"  # Edge 실행
+OCR_TIMEOUT_MS = 15 * 60 * 1000  # OCR 최대 대기(15분)
+SAVE_DELAY_SEC = 5  # OCR 완료 후 저장까지 지연(초)
 
 # ===================== 파일명 인식 =====================
 ALLOWED_EXTS = {".pdf", ".doc", ".docx"}
-# 예: 2015_11_수학_문제.pdf / 2015_11_수학_해설.pdf / 2015_11_수학_답지(1).PDF / ...
+# 예: 2024_08_수학A_문제.pdf / 2024_08_수학A_해설.pdf
 PATTERN = re.compile(
-    r"""^(?P<base>.+?)_
-         (?P<role>문제(?:지)?|해설(?:지)?|답(?:안|지)?)
-         \s*(?:\(\d+\))?
-         (?:\.[^.]+)+$
-     """,
+    r"""
+    ^
+    (?P<base>
+        \s*\d{4}_\d{1,2}_.+?  # 년도_월_과목이름 (예: 2024_08_수학A)
+    )
+    _
+    (?P<role>
+        문제(?:지)?|해설(?:지)?|답(?:안|지)?
+    )
+    \s*(?:\(\d+\))?
+    (?:\.[^.]+)+
+    $
+    """,
     re.IGNORECASE | re.VERBOSE
 )
 
@@ -33,16 +41,15 @@ def find_all_pairs_in_folder(folder: Path, debug=True):
     for p in folder.iterdir():
         if not p.is_file():
             continue
-        # 이중 확장자(.pdf.pdf 등)도 허용
         if not any(sfx.lower() in ALLOWED_EXTS for sfx in p.suffixes):
             skipped.append((p.name, "확장자 제외")); continue
         m = PATTERN.match(p.name.strip())
         if not m:
             skipped.append((p.name, "이름 패턴 불일치")); continue
+        
         base = m.group("base").strip()
-        role = "문제" if "문제" in m.group("role") else "해설"  # 답지/답안은 해설로
+        role = "문제" if "문제" in m.group("role") else "해설"
         d = by_base.setdefault(base, {})
-        # 중복 파일이 있으면 최초만 사용
         d.setdefault(role, p)
 
     pairs = []
@@ -50,7 +57,6 @@ def find_all_pairs_in_folder(folder: Path, debug=True):
         if "문제" in d and "해설" in d:
             pairs.append((base, d["문제"], d["해설"]))
 
-    # base 기준 사전순 정렬 (원하면 여기서 년/월 파싱해서 커스텀 정렬도 가능)
     pairs.sort(key=lambda x: x[0])
 
     if debug:
@@ -69,7 +75,27 @@ def find_all_pairs_in_folder(folder: Path, debug=True):
         )
     return pairs
 
-# ===================== 브라우저/컨텍스트 =====================
+def infer_categories_from_folder(folder: Path):
+    """
+    폴더 이름이 '1차_2차_3차' 형태라면 해당 카테고리 배열을 반환.
+    예: C:\\...\\기출문제_고3_수학 → ['기출문제', '고3', '수학']
+    규칙이 아니면 기본 CATEGORIES를 그대로 반환.
+    """
+    name = folder.name.strip()
+    separators = ["_", "-", " "]
+    parts = []
+    
+    for sep in separators:
+        if sep in name:
+            parts = [p.strip() for p in name.split(sep) if p.strip()]
+            if len(parts) > 1:
+                break
+    
+    if len(parts) > 1 and len(parts) <= 4:
+        return [p.replace(" ", "") for p in parts]
+    
+    return CATEGORIES[:]
+
 def get_browser_and_context(p):
     """세션 파일(STORAGE_PATH) 있으면 재사용, 없으면 새 컨텍스트."""
     browser = p.chromium.launch(headless=False, channel=EDGE_CHANNEL)
@@ -79,7 +105,6 @@ def get_browser_and_context(p):
         ctx = browser.new_context()
     return browser, ctx
 
-# ===================== 페이지 보장/로그인 =====================
 def on_create_page(page) -> bool:
     """문제 생성 페이지인지 판별: '학습지명/문제지명' 인풋 존재 확인"""
     field = page.locator("input[placeholder*='학습지명']")
@@ -89,20 +114,24 @@ def on_create_page(page) -> bool:
         )
     return field.count() > 0
 
-def try_login_if_needed(page):
+def try_login_if_needed(page, user, pw):
     """
-    로그인 페이지면 자동 로그인(ENV 없으면 콘솔 입력) 후
-    곧바로 문제 생성 페이지로 이동.
+    로그인 페이지면 자동 로그인 후 문제 생성 페이지로 이동.
+    GUI에서 전달받은 아이디/비밀번호를 사용.
     """
     if "login" not in page.url.lower():
         return
 
-    user = os.getenv("GENI_ID")
-    pw   = os.getenv("GENI_PW")
+    if not user:
+        user = os.getenv("GENI_ID")
+    if not pw:
+        pw = os.getenv("GENI_PW")
+    
     if not user:
         user = input("GENITEACHER 아이디: ").strip()
     if not pw:
         pw = getpass("GENITEACHER 비밀번호: ").strip()
+        
     if not user or not pw:
         raise RuntimeError("아이디/비밀번호가 비었습니다.")
 
@@ -119,7 +148,7 @@ def try_login_if_needed(page):
     page.goto(UPLOAD_URL, wait_until="load")
     page.wait_for_load_state("networkidle")
 
-def reach_create_page(page, max_steps=4):
+def reach_create_page(page, user, pw, max_steps=4):
     """
     어디로 리다이렉트되든 최종적으로 '문제 생성' 페이지로 진입.
     """
@@ -131,10 +160,9 @@ def reach_create_page(page, max_steps=4):
         if on_create_page(page):
             return
         if "login" in page.url.lower():
-            try_login_if_needed(page)
+            try_login_if_needed(page, user, pw)
             if on_create_page(page):
                 return
-        # 메뉴 경유(명칭이 다르면 여기 수정)
         try:
             mgmt = (page.get_by_role("link", name=re.compile("^문제\s*관리$")) |
                     page.get_by_text("문제 관리", exact=True) |
@@ -158,7 +186,6 @@ def reach_create_page(page, max_steps=4):
 BUSY_REGEX = re.compile(r"(OCR|변환|추출|처리 중|분석 중)", re.I)
 
 def _ocr_done_signal(page) -> bool:
-    # 저장/저장하기/완료 버튼 또는 문항 리스트가 보이면 완료로 간주
     if page.get_by_role("button", name=re.compile("저장하기|저장|완료")).count() > 0:
         return True
     if page.locator("text=문항").count() > 0:
@@ -231,11 +258,9 @@ def click_save(page):
         return
     raise RuntimeError("저장 버튼을 찾지 못했습니다.")
 
-# ===================== 핵심 동작: 한 쌍 업로드 =====================
-def process_one_set(page, base, problem_file: Path, answer_file: Path):
+def process_one_set(page, base, problem_file: Path, answer_file: Path, categories):
     """한 세트(문제/해설) 업로드 → 다음 → OCR 대기 → (5초) → 저장."""
-    # 항상 문제 생성 페이지에서 시작하도록 보장
-    reach_create_page(page)
+    reach_create_page(page, None, None)
 
     # 1) 문제지명 입력
     name_input = page.locator("input[placeholder*='학습지명']")
@@ -249,11 +274,13 @@ def process_one_set(page, base, problem_file: Path, answer_file: Path):
     name_input.first.fill(base)
 
     # 2) 카테고리 선택
-    for cat in CATEGORIES:
-        loc = page.get_by_text(cat, exact=True)
-        if loc.count() == 0:
-            loc = page.locator(f"text={cat}").first
+    print(f"[*] 카테고리 선택: {' > '.join(categories)}")
+    for cat in categories:
+        loc = page.get_by_text(cat, exact=True).first
+        loc.wait_for(state="visible", timeout=10000)
         loc.click()
+        print(f"  - '{cat}' 클릭")
+        time.sleep(0.5)
 
     # 3) 파일 업로드
     file_inputs = page.locator("input[type='file']")
@@ -274,34 +301,30 @@ def process_one_set(page, base, problem_file: Path, answer_file: Path):
     click_save(page)
     print(f"[✓] {base} : 저장 완료.")
 
-# ===================== 메인(여러 쌍 순차 처리) =====================
-def run(folder: Path):
-    pairs = find_all_pairs_in_folder(folder, debug=True)  # [(base, 문제, 해설), ...]
+def run(folder: Path, ent_id=None, ent_pw=None, log_queue=None):
+    pairs = find_all_pairs_in_folder(folder, debug=True)
+    derived_categories = infer_categories_from_folder(folder)
+    print(f"▶ 적용 카테고리: {' > '.join(derived_categories)}")
+
     with sync_playwright() as p:
         browser, context = get_browser_and_context(p)
         page = context.new_page()
 
-        # 첫 진입: 목표 페이지 → 로그인 필요시 처리
         page.goto(UPLOAD_URL, wait_until="load")
         page.wait_for_load_state("networkidle")
-        try_login_if_needed(page)
-        reach_create_page(page)
+        try_login_if_needed(page, ent_id, ent_pw)
+        reach_create_page(page, ent_id, ent_pw)
 
-        # 모든 쌍 순차 업로드
         for i, (base, prob, ans) in enumerate(pairs, 1):
             print(f"\n=== [{i}/{len(pairs)}] {base} 업로드 시작 ===")
-            process_one_set(page, base, prob, ans)
-
-            # 다음 세트를 위해 문제 생성 페이지로 복귀
-            # (사이트에 따라 '문제 생성' 버튼/링크로 돌아가는 과정이 필요할 수 있어 강제 이동)
+            process_one_set(page, base, prob, ans, derived_categories)
+            
             page.goto(UPLOAD_URL, wait_until="load")
             page.wait_for_load_state("networkidle")
 
-        # 세션 저장
         context.storage_state(path=STORAGE_PATH)
         print("\n[✓] 모든 세트 업로드 및 저장 완료.")
 
-# ===================== 실행 진입점 =====================
 if __name__ == "__main__":
     if len(sys.argv) >= 2:
         arg = sys.argv[1].strip().strip('"').strip("'").rstrip("\\/")
